@@ -1,67 +1,115 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from 'cloudflare:workers';
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+interface Env {
+	DB: D1Database;
+	CLIPBOARD_DO: DurableObjectNamespace;
+}
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
+type ClipboardItem = { id: number; value: string };
+
+export class ClipboardDO extends DurableObject {
+	state: DurableObjectState;
+	env: Env;
+	constructor(state: DurableObjectState, env: Env) {
+		super(state, env);
+		this.state = state;
+		this.env = env;
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
+	async fetch(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+		const customerId = url.searchParams.get('customer_id') || 'default';
+
+		// --- CORS handling start ---
+		const corsHeaders = {
+			'Access-Control-Allow-Origin': '*',
+			'Access-Control-Allow-Methods': 'GET, PUT, DELETE, OPTIONS',
+			'Access-Control-Allow-Headers': 'Content-Type',
+		};
+
+		// Handle preflight OPTIONS request
+		if (request.method === 'OPTIONS') {
+			return new Response(null, {
+				status: 204,
+				headers: corsHeaders,
+			});
+		}
+		// --- CORS handling end ---
+
+		try {
+			switch (request.method) {
+				case 'PUT': {
+					const data = await request.text();
+					const parsedData = JSON.parse(data);
+					await this.handleSync(parsedData.id, customerId, parsedData.clipboard_data);
+					return new Response('Data synced successfully', { headers: corsHeaders });
+				}
+				case 'GET': {
+					const result = await this.handleGet(customerId);
+					return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+				}
+				case 'DELETE': {
+					const body = (await request.json()) as ClipboardItem;
+					const id = body?.id;
+					if (typeof id !== 'number') {
+						return new Response('Missing or invalid id in JSON body', { status: 400, headers: corsHeaders });
+					}
+					await this.handleDel(id);
+					return new Response('Data deleted successfully', { headers: corsHeaders });
+				}
+				default:
+					return new Response('Method not allowed', { status: 405, headers: corsHeaders });
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return new Response(`Error: ${message}`, { status: 500, headers: corsHeaders });
+		}
+	}
+
+	private async handleSync(id: number, customer_id: string, clipboard_data: string): Promise<number> {
+		// 1. Store in local DO storage
+
+		// 2. Sync to central D1 (last-write-wins)
+
+		const result = await this.env.DB.prepare(
+			`INSERT OR REPLACE INTO CLIPBOARD (id, customer_id, clipboard_data) 
+         VALUES (?1, ?2, ?3)`
+		)
+			.bind(id, customer_id, clipboard_data)
+			.run();
+
+		const insertId = result.meta?.last_row_id as number;
+
+		await this.state.storage.put(String(insertId), { customer_id, clipboard_data });
+
+		return id;
+	}
+
+	private async handleGet(customerId: string): Promise<{ id: number; clipboard_data: string }[]> {
+		const rows = await this.env.DB.prepare(`SELECT id, clipboard_data FROM CLIPBOARD WHERE customer_id = ?1 ORDER BY id DESC`)
+			.bind(customerId)
+			.all();
+
+		for (const row of rows.results) {
+			await this.state.storage.put(String(row.id), { customerId, data: row.clipboard_data });
+		}
+
+		return rows.results as { id: number; clipboard_data: string }[];
+	}
+
+	private async handleDel(id: number): Promise<void> {
+		await this.state.storage.delete(String(id));
+		await this.env.DB.prepare(`DELETE FROM CLIPBOARD WHERE id = ?1`).bind(id).run();
 	}
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a `DurableObjectId` for an instance of the `MyDurableObject`
-		// class name comes from the pathname. Requests from all Workers to the instance named
-		//  by the pathname. will go to a single globally unique Durable Object instance.
-		const name = new URL(request.url).pathname;
-		const id : DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(name);
+	async fetch(request: Request, env: Env): Promise<Response> {
+		const url = new URL(request.url);
+		const customerId = url.searchParams.get('customer_id') || 'default';
+		const doId = env.CLIPBOARD_DO.idFromName(customerId);
+		const stub = env.CLIPBOARD_DO.get(doId);
 
-		// Create a stub to open a communication channel with the Durable
-		// Object instance.
-		const stub = env.MY_DURABLE_OBJECT.get(id);
-
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance
-		const greeting = await stub.sayHello(name);
-
-		return new Response(greeting);
+		return stub.fetch(request);
 	},
 } satisfies ExportedHandler<Env>;
